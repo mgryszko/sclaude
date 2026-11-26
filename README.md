@@ -61,6 +61,7 @@ sclaude sandbox show              # the config with paths expanded
 sclaude sandbox add-project DIR   # Claude may start in DIR and write to it
 sclaude sandbox add-write PATH    # Claude may write to PATH
 sclaude sandbox add-env 'AWS_*'   # pass variables into the sandbox
+sclaude sandbox add-option project-tmp   # turn on an option, see Options below
 sclaude sandbox remove ENTRY
 sclaude sandbox help              # all commands, version and update included
 ```
@@ -108,13 +109,16 @@ $TMPDIR
 ANTHROPIC_*
 CLAUDE_*
 LC_*
+
+[options]
 ```
 
 It allows only what Claude Code needs to run:
 
 - no project, so the first start asks to add the current folder,
 - writes to Claude's config folder, `~/.claude.json`, its lock files in `~/.local/state/claude` and the temporary folder,
-- the variables Claude reads for its login and settings, and the locale.
+- the variables Claude reads for its login and settings, and the locale,
+- no option.
 
 Add everything else yourself, for example the caches of the tools Claude runs (`~/.cache/uv`, `~/.npm`, `~/.gradle`).
 Without a config file, `sclaude` refuses to start and tells you to run `init`.
@@ -126,6 +130,7 @@ Without a config file, `sclaude` refuses to start and tells you to run `init`.
 | `[projects]` | a folder Claude may start in and write to | not supported, rejected | Claude starts nowhere until you add a folder, at the question above or with `add-project` |
 | `[write]` | a file or folder Claude may write to | not supported, rejected | Claude writes only to `/tmp` and `/dev`, not even to its own config |
 | `[env]` | a variable, or a pattern such as `AWS_*` | passes every variable | only `PATH HOME USER SHELL TERM COLORTERM LANG` pass |
+| `[options]` | an option, see [Options](#options) | not supported, rejected | every option is off |
 
 A missing section is the same as an empty one: it allows nothing.
 `sclaude` always passes `--deny-write` and `--deny-env` to mise, so nothing is allowed unless an entry allows it.
@@ -136,6 +141,44 @@ A missing section is the same as an empty one: it allows nothing.
 Paths in `[projects]` and `[write]` are absolute or start with `~`, `$HOME` or `$TMPDIR`. No other variables are expanded,
 and no wildcards: mise doesn't support them in writable paths.
 `#` starts a comment, at the start of a line or after an entry.
+
+### Options
+
+| Option | What it does |
+|---|---|
+| `project-tmp` | Claude keeps its temp files and session scratchpad in `.local/tmp` of the project, so they survive a reboot |
+| `project-tmp=DIR` | the same in `DIR` |
+
+#### project-tmp
+
+Claude Code keeps its temp files and the session scratchpad under `/tmp` by default, and macOS clears `/tmp` on a reboot.
+With `project-tmp`, `sclaude` sets `CLAUDE_CODE_TMPDIR` to `.local/tmp` of the project before Claude starts.
+Claude adds its own `claude-<uid>` folder below it.
+
+```sh
+sclaude sandbox add-option project-tmp
+sclaude sandbox add-option project-tmp=.cache/claude   # a folder of your choice
+sclaude sandbox remove project-tmp                     # turn it off; give a project-tmp=DIR entry as show prints it
+```
+
+- The project is the entry in `[projects]` that holds the folder Claude starts in, the longest one if several do.
+  Started in a subfolder, Claude still uses the project's temp folder, so subfolders don't each get one.
+- `DIR` is relative to the project, or absolute (starting with `/`, `~`, `$HOME` or `$TMPDIR`).
+  A relative `DIR` can't leave the project with `..`. An absolute `DIR` is shared by every project,
+  and it must already be writable: in a project, in `[write]` or under `/tmp`. Otherwise `sclaude` refuses and
+  prints the `add-write` command. The config may hold one `project-tmp` entry; remove it before adding another.
+- `DIR` can't be a whole project or `[write]` entry, such as `project-tmp=.`: the `.gitignore` below would hide it from git.
+- `sclaude` creates the folder if it is missing, inside the sandbox. When the folder is new or empty, it puts a
+  `.gitignore` with `*` in it. That file makes git ignore the folder and itself, so temp files never show up as untracked
+  changes, whatever the project's own `.gitignore` says. A folder that already holds files is left as it is, so make sure
+  your `.gitignore` covers it.
+- A folder in the project needs no `[write]` entry, since the project is writable.
+  `sclaude` sets the variable after the sandbox filters the environment, so it needs no `[env]` entry either.
+- A `CLAUDE_CODE_TMPDIR` you set in your shell wins over the option. It reaches Claude only if `[env]` lets it through,
+  for example with `CLAUDE_*`. A value in your user or managed Claude settings may take over too.
+
+Setting `CLAUDE_CODE_TMPDIR` in a project's `.claude/settings.json` or `.claude/settings.local.json` doesn't work:
+Claude Code [ignores it there](https://code.claude.com/docs/en/env-vars).
 
 ### Second Claude config folder
 

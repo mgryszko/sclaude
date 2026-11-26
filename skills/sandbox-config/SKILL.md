@@ -84,6 +84,9 @@ Never propose these, and if the user asks for one, explain what it lets the sand
 When a command fails with "overlaps", the path would let the sandbox change what starts it.
 Don't look for a way around it; tell the user which protected file it overlaps.
 
+When the user wants Claude's temp files or scratchpad to survive a reboot, or to live in the project,
+offer `sclaude sandbox add-option project-tmp`, or `project-tmp=DIR` for another folder (see Options in the README).
+
 To remove an entry, run `sclaude sandbox remove ENTRY` with the entry as `show` prints it or as written in the file.
 
 ## 5. Finish

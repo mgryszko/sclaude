@@ -3,7 +3,7 @@
 # come from a config file that the sandbox itself cannot write.
 set -euo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 repo="mgryszko/sclaude"
 config="${SCLAUDE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/sclaude/config}"
 
@@ -22,7 +22,8 @@ Usage:
   sclaude sandbox add-project DIR  Let Claude start in DIR and write to it
   sclaude sandbox add-write PATH   Let Claude write to PATH
   sclaude sandbox add-env VAR      Pass VAR into the sandbox (wildcards such as AWS_* or * allowed)
-  sclaude sandbox remove ENTRY     Remove a path or a variable from the config
+  sclaude sandbox add-option OPT   Turn on an option: project-tmp or project-tmp=DIR
+  sclaude sandbox remove ENTRY     Remove a path, a variable or an option from the config
   sclaude sandbox version          Print the installed version
   sclaude sandbox update           Install the latest release over this script
   sclaude sandbox help             Print this help
@@ -108,6 +109,11 @@ $TMPDIR
 ANTHROPIC_*
 CLAUDE_*
 LC_*
+
+# Options, off unless listed.
+# project-tmp: Claude keeps its temp files and scratchpad in .local/tmp of the project, not under /tmp.
+# project-tmp=DIR: the same in DIR, relative to the project or absolute. An absolute DIR must be writable.
+[options]
 CONFIG
 }
 
@@ -120,6 +126,49 @@ expand_path() {
   esac
   [[ $path == /* ]] || die "not an absolute path: $1"
   echo "$path"
+}
+
+# A project-tmp folder is absolute, or relative to the project without leaving it.
+check_tmp_syntax() {
+  case $1 in
+    /* | "~"* | '$HOME'* | '$TMPDIR'*) expand_path "$1" >/dev/null ;;
+    *)
+      [[ /$1/ != */../* ]] || die "project-tmp folder $1 leaves the project, use an absolute path instead"
+      [[ -n ${1//[.\/]/} ]] || die "project-tmp folder $1 is the project itself, name a folder in it"
+      ;;
+  esac
+}
+
+# Refuses a project-tmp folder the sandbox can't write, or one that is a whole project or [write] entry,
+# whose files its .gitignore would hide from git.
+check_tmp_dir() {
+  local target allowed
+  target="$(resolve "$1")"
+  for allowed in ${projects[@]+"${projects[@]}"} ${writable[@]+"${writable[@]}"}; do
+    [[ $target != "$(resolve "$allowed")" ]] || die "project-tmp folder $1 is a whole entry of $config, name a folder in it"
+  done
+  writable_in_sandbox "$1" || die "project-tmp folder $1 is not writable in the sandbox, add it with: sclaude sandbox add-write $1"
+}
+
+# Prints the project-tmp folder $2 for project $1.
+tmp_path() {
+  case $2 in
+    /* | "~"* | '$HOME'* | '$TMPDIR'*) expand_path "$2" ;;
+    *) echo "$1/$2" ;;
+  esac
+}
+
+# Succeeds when the sandbox lets Claude write $1: it is in a project, a [write] entry or /tmp.
+writable_in_sandbox() {
+  local target allowed
+  target="$(resolve "$1")"
+  for allowed in /tmp /private/tmp ${projects[@]+"${projects[@]}"} ${writable[@]+"${writable[@]}"}; do
+    allowed="$(resolve "$allowed")"
+    if [[ $target == "$allowed" || $target == "$allowed"/* ]]; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 # Resolves symlinks. A path that doesn't exist yet resolves through its parent folder.
@@ -149,7 +198,9 @@ read_config() {
   projects=()
   writable=()
   env_allowed=()
-  local line path section="" n=0
+  options=()
+  project_tmp=""
+  local line path name value section="" n=0
   while IFS= read -r line || [[ -n $line ]]; do
     n=$((n + 1))
     line="${line%%#*}"
@@ -160,6 +211,7 @@ read_config() {
       "[projects]") section=projects ;;
       "[write]") section=write ;;
       "[env]") section=env ;;
+      "[options]") section=options ;;
       "["*) die "$config:$n: unknown section $line" ;;
       *)
         case $section in
@@ -172,6 +224,24 @@ read_config() {
             writable+=("$path")
             ;;
           env) env_allowed+=("$line") ;;
+          options)
+            name="${line%%=*}"
+            name="${name%"${name##*[![:space:]]}"}"
+            value=""
+            if [[ $line == *=* ]]; then
+              value="${line#*=}"
+              value="${value#"${value%%[![:space:]]*}"}"
+              [[ -n $value ]] || die "$config:$n: $name= needs a folder"
+            fi
+            case $name in
+              project-tmp)
+                project_tmp="${value:-.local/tmp}"
+                check_tmp_syntax "$project_tmp"
+                ;;
+              *) die "$config:$n: unknown option $line" ;;
+            esac
+            options+=("$line")
+            ;;
           *) die "$config:$n: entry outside a section: $line" ;;
         esac
         ;;
@@ -201,15 +271,18 @@ check_writable() {
   done < <(protected_paths)
 }
 
+# Sets project_root to the project Claude starts in: the longest entry in [projects] that holds the current folder.
 check_cwd() {
   local cwd project
   cwd="$(realpath "$PWD")"
+  project_root=""
   for project in ${projects[@]+"${projects[@]}"}; do
     project="$(resolve "$project")"
-    if [[ $cwd == "$project" || $cwd == "$project"/* ]]; then
-      return 0
+    if [[ ($cwd == "$project" || $cwd == "$project"/*) && ${#project} -gt ${#project_root} ]]; then
+      project_root="$project"
     fi
   done
+  [[ -z $project_root ]] || return 0
   local hint="sclaude sandbox add-project $PWD" answer
   [[ -t 0 && -t 2 ]] || die "$PWD is not in a project listed in $config, add it with: $hint"
 
@@ -219,6 +292,7 @@ check_cwd() {
   check_writable "$cwd"
   insert_entry projects "$(abbreviate "$cwd")"
   projects+=("$cwd")
+  project_root="$cwd"
   echo "Added $(abbreviate "$cwd") to [projects]." >&2
 }
 
@@ -263,12 +337,39 @@ Cmd fails "Operation not permitted", file write fails no reason, subprocess/MCP 
 PROMPT
   )"
 
+  # With project-tmp, Claude keeps its temp files in the project or the folder it names, so its scratchpad survives
+  # a reboot.
+  # A CLAUDE_CODE_TMPDIR set in the shell wins.
+  local tmp_dir=""
+  if [[ -n $project_tmp && -z ${CLAUDE_CODE_TMPDIR:-} ]]; then
+    tmp_dir="$(tmp_path "$project_root" "$project_tmp")"
+    check_tmp_dir "$tmp_dir"
+  fi
+
   # mise reads its config, installs tools and runs hooks outside the sandbox. Started in a project, it would
   # load that project's mise.toml, which Claude can write. From / it loads only the global config.
+  # The temp folder is made inside the sandbox too, since the project is Claude's to change. A new or empty folder gets
+  # a .gitignore of `*`, which ignores the folder and itself, so temp files never show up as untracked, whatever the
+  # project's own .gitignore says. A folder that already holds files is left as it is.
+  # It is exported after mise filters the environment, so it doesn't need an [env] entry.
   local project_dir="$PWD"
   cd /
   exec mise exec "${sandbox_args[@]}" -- \
-    sh -c 'cd "$1" && shift && exec claude "$@"' sh "$project_dir" --append-system-prompt "$prompt" \
+    sh -c '
+      cd "$1" || exit 1
+      if [ -n "$2" ]; then
+        if [ ! -e "$2" ] || [ -z "$(ls -A "$2")" ]; then
+          mkdir -p "$2" && printf "*\n" >"$2/.gitignore"
+        fi && [ -d "$2" ] || {
+          echo "sclaude: could not create the temp folder $2" >&2
+          exit 1
+        }
+        CLAUDE_CODE_TMPDIR="$2"
+        export CLAUDE_CODE_TMPDIR
+      fi
+      shift 2
+      exec claude "$@"
+    ' sh "$project_dir" "$tmp_dir" --append-system-prompt "$prompt" \
     ${claude_args[@]+"${claude_args[@]}"} "$@"
 }
 
@@ -311,6 +412,8 @@ sandbox_show() {
   printf '%s\n' ${writable[@]+"${writable[@]}"}
   echo "[env]"
   printf '%s\n' ${env_allowed[@]+"${env_allowed[@]}"}
+  echo "[options]"
+  printf '%s\n' ${options[@]+"${options[@]}"}
 }
 
 # Inserts the entry right under its section header, or appends the section when it's missing.
@@ -361,6 +464,30 @@ add_env() {
   echo "Added $var to [env]. Restart Claude to apply it."
 }
 
+add_option() {
+  local option="${1:-}" existing dir
+  [[ -n $option ]] || die "missing option"
+  case $option in
+    project-tmp) ;;
+    project-tmp=?*)
+      check_tmp_syntax "${option#project-tmp=}"
+      ;;
+    *) die "unknown option $option, the options are: project-tmp, project-tmp=DIR" ;;
+  esac
+  read_config
+  for existing in ${options[@]+"${options[@]}"}; do
+    if [[ ${existing%%[=[:space:]]*} == "${option%%=*}" ]]; then
+      die "$existing is already in $config, remove it first with: sclaude sandbox remove '$existing'"
+    fi
+  done
+  dir="${option#project-tmp=}"
+  if [[ $dir != "$option" && $dir == [/~\$]* ]]; then
+    check_tmp_dir "$(tmp_path / "$dir")"
+  fi
+  insert_entry options "$option"
+  echo "Added $option to [options]. Restart Claude to apply it."
+}
+
 remove_entry() {
   local entry="${1:-}" stored tmp status
   [[ -n $entry ]] || die "missing entry"
@@ -395,6 +522,7 @@ sandbox_command() {
     add-project) add_path projects "$@" ;;
     add-write) add_path write "$@" ;;
     add-env) add_env "$@" ;;
+    add-option) add_option "$@" ;;
     remove) remove_entry "$@" ;;
     version) echo "sclaude $VERSION" ;;
     update) sandbox_update ;;
